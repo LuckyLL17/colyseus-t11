@@ -4,7 +4,7 @@ import type { InputAPI, DefineInputOptions, IdleDeclared } from './input/types.t
 import { RoomInput } from './input/RoomInput.ts';
 import { RoomMessages } from './RoomMessages.ts';
 import { Rewind, type RewindOptions } from './Rewind.ts';
-export { type InputAccessor, type InputAPI, type NormalizedInputOptions, type ConsumeOptions, type IdleInput, type IdleContext, type SanitizeInput, type NumericFieldsOf, type DefineInputOptions, type IdleDeclared } from './input/types.ts';
+export { type InputAccessor, type InputAPI, type NormalizedInputOptions, type ReliableInputOptions, type ConsumeOptions, type IdleInput, type IdleContext, type SanitizeInput, type NumericFieldsOf, type DefineInputOptions, type IdleDeclared } from './input/types.ts';
 
 import { ClockTimer as Clock } from '@colyseus/timer';
 
@@ -908,6 +908,9 @@ export class Room<T extends RoomOptions = RoomOptions> {
 
       this._simulationInterval = setInterval(() => {
         this.clock.tick();
+        // Release any sequenced-reliable inputs whose ordering gap just expired
+        // BEFORE user code runs, so the step consumes only policy-released inputs.
+        this._inputController?.tick();
         onTickCallback(this.clock.deltaTime);
       }, delay);
     }
@@ -1012,6 +1015,12 @@ export class Room<T extends RoomOptions = RoomOptions> {
     this._simulationInterval = setInterval(() => {
       this.clock.tick();
       acc += this.clock.deltaTime;
+
+      // Age out expired sequencing gaps ONCE per interval, BEFORE any step
+      // runs: every fixed step in the catch-up batch then drains only inputs
+      // the ordered window released (in-order arrivals or due expiries),
+      // never a parked/side-effectful one.
+      this._inputController?.tick();
 
       // Run a whole number of FIXED steps to consume the measured time.
       let ran = 0;
@@ -1879,8 +1888,12 @@ export class Room<T extends RoomOptions = RoomOptions> {
 
       // NOT gated by skipHandshake: that flag means "client already has the STATE
       // schema", but these carry input config the client can't derive locally
-      // (re-parsing on reconnect is idempotent).
-      const extraSections = this._inputController?.handshakeSections();
+      // (re-parsing on reconnect is idempotent). On a RE-join of a held seat the
+      // sequenced channel negotiates the last ack point in these same sections.
+      const extraSections = this._inputController?.handshakeSections(
+        sessionId,
+        isWaitingReconnection,
+      );
 
       // confirm room id that matches the room name requested to join
       client.raw(getMessageBytes[Protocol.JOIN_ROOM](

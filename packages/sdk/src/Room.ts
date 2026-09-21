@@ -603,7 +603,6 @@ export class Room<
                 } else if (tag === HandshakeSection.INPUT_OPTIONS) {
                     (this.#input ??= new RoomInput(this)).applyOptions(buffer, it);
                 }
-
                 it.offset = sectionEnd;
             }
 
@@ -621,6 +620,13 @@ export class Room<
                 this.onJoin.invoke();
 
             } else {
+                // Sequenced reliable reconnect: adopt the server's negotiated
+                // ack and replay the unacked inputs in seq order BEFORE any
+                // messages queued during the outage are flushed (below), so the
+                // server sees a gap-free prefix over its reliable channel.
+                // Legacy/unreliable rooms: no-op (their handle was zero-reset
+                // at disconnect).
+                this.#input?.replayAfterReconnect();
                 console.info(`[Colyseus reconnection]: ${String.fromCodePoint(0x2705)} reconnection successful!`); // ✅
                 this.reconnection.isReconnecting = false;
                 this.onReconnect.invoke();
@@ -763,6 +769,9 @@ export class Room<
             // discarded until the new counter catches up past it, and `sentCount`
             // stays permanently ahead. Reconcilers follow this reset on their own
             // (they poll the handle's `epoch`) — no `onReconnect` wiring needed.
+            // SEQUENCED reliable handles: this reset is a no-op — the reconnect
+            // handshake negotiates the last ack point and the JOIN_ROOM handler
+            // replays unacked inputs in order instead (see replayAfterReconnect).
             this.#input?.reset();
         }
 

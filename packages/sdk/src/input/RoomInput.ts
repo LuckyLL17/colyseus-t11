@@ -62,8 +62,21 @@ export class RoomInput {
      *  (`setFixedTimestep(..., { subSteps })`). */
     #subSteps?: number;
 
+    /** Server enabled the ordered reliable input channel
+     *  (`InputFlags.SEQUENCED`): reliable inputs carry an explicit seq, the
+     *  server parks/orders them, and reconnect replays the unacked set. */
+    #sequenced = false;
+
+    /** Server-advertised ordered receive-window capacity (seqs). */
+    #receiveWindow?: number;
+
     constructor(room: Room) {
         this.#room = room;
+    }
+
+    /** Whether the room's handshake enabled the sequenced reliable channel. */
+    get sequenced(): boolean {
+        return this.#sequenced;
     }
 
     /** Snapshot cadence (ms), so {@link Room} can feed `clock.setPatchInterval`. */
@@ -91,17 +104,36 @@ export class RoomInput {
 
     /**
      * Decode the `INPUT_OPTIONS` handshake section.
-     * `[flags uint8][tickRate varint?][patchRate varint?][subSteps varint?]`,
-     * varints in bit order. Advances `it`.
+     * `[flags uint8][tickRate varint?][patchRate varint?][subSteps varint?]
+     *  [receiveWindow varint?][reconnectAck varint?]`, varints in bit order.
+     * Advances `it`. Returns the negotiated reconnect ack seq (`0` unless the
+     * section carried `RECONNECT_ACK` for a resuming sequenced session).
      */
-    applyOptions(buffer: Uint8Array, it: Iterator): void {
-        const flags = buffer[it.offset++];
+    applyOptions(buffer: Uint8Array, it: Iterator): number {
+        const flags = buffer[it.offset++]!;
         this.#stampRender = (flags & InputFlags.RENDER_TIME) !== 0;
         this.#stampReckon = (flags & InputFlags.RECKON_TIME) !== 0;
+        this.#sequenced = (flags & InputFlags.SEQUENCED) !== 0;
+        // Explicit bit checks (never truthiness): a later flag's bit must not
+        // make an absent trailing varint parse from the next field's bytes.
         if (flags & InputFlags.FIXED_TIMESTEP) this.#tickRate = decode.number(buffer as Buffer, it);
         if (flags & InputFlags.PATCH_RATE) this.#patchRate = decode.number(buffer as Buffer, it);
         if (flags & InputFlags.SUB_STEPS) this.#subSteps = decode.number(buffer as Buffer, it);
+        if (flags & InputFlags.SEQUENCED) this.#receiveWindow = decode.number(buffer as Buffer, it);
+        const reconnectAck = (flags & InputFlags.RECONNECT_ACK)
+            ? decode.number(buffer as Buffer, it)
+            : 0;
+        // Adopt immediately when the app already has a handle (normal reconnect
+        // after at least one send); stash for lazy handle creation otherwise.
+        if (reconnectAck > 0) {
+            this.#pendingReconnectAck = reconnectAck;
+            this.#handle?.adoptReconnectAck(reconnectAck);
+        }
+        return reconnectAck;
     }
+
+    /** Negotiated reconnect ack pending adoption by a lazily-created handle. */
+    #pendingReconnectAck = 0;
 
     /** Feed the server's last-processed input seq to the handle; returns the RTT
      *  sample (or `-1` before the handle exists / when the seq aged out). */
@@ -109,8 +141,29 @@ export class RoomInput {
         return this.#handle ? this.#handle.ackInput(inputSeq) : -1;
     }
 
-    /** Reset the input round-trip on reconnect (see {@link Room} reconnection). */
+    /** Whether the per-room input handle exists yet (drives reconnect order). */
+    hasHandle(): boolean {
+        return this.#handle !== undefined;
+    }
+
+    /**
+     * Replay the sequenced reliable channel after a successful reconnect:
+     * adopt the server's negotiated ack point and re-send every sent-but-unacked
+     * input above it, in seq order, before any messages queued during the
+     * outage are flushed. No-op when the room isn't sequenced or the app never
+     * created a handle. Returns the number of inputs re-sent.
+     */
+    replayAfterReconnect(): number {
+        return this.#handle ? this.#handle.replayAfterReconnect() : 0;
+    }
+
+    /** Reset the input round-trip on reconnect. SEQUENCED handles do NOT reset
+     *  here — the handshake negotiates the ack point and {@link replayAfterReconnect}
+     *  resumes the stream (called from the SDK's disconnect path; a sequenced
+     *  zeroing would lose the seqs the replay has to resend). Legacy /
+     *  unreliable handles keep the original reset. */
     reset(): void {
+        if (this.#handle?.sequenced) { return; }
         this.#handle?.reset();
     }
 
@@ -149,7 +202,14 @@ export class RoomInput {
             tickRate: this.#tickRate,
             patchRate: this.#patchRate,
             subSteps: this.#subSteps,
+            sequenced: this.#sequenced,
+            receiveWindow: this.#receiveWindow,
         });
+        if (this.#pendingReconnectAck > 0) {
+            // Handle created lazily AFTER the reconnect handshake — adopt the
+            // negotiated point now (sends above it remain replayable).
+            this.#handle.adoptReconnectAck(this.#pendingReconnectAck);
+        }
         this.#options = options;
         this.#encoder = encoder;
         return this.#handle as InputHandle<I>;

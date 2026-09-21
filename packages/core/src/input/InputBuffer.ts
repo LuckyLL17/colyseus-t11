@@ -1,6 +1,7 @@
 import type { ClientPrivate } from '../Transport.ts';
 import { $METADATA } from '../utils/Utils.ts';
 
+import type { OrderedWindow } from './OrderedWindow.ts';
 import type {
   ConsumeOptions, IdleContext, IdleInput, InputAccessor, SanitizeInput,
 } from './types.ts';
@@ -95,6 +96,21 @@ export function seedInputZeroValues(instance: any, ctor: new () => any): void {
  *  keeping per-consume work O(1) (no `shift()` re-index on every input). */
 const COMPACT_THRESHOLD = 32;
 
+/**
+ * What the ordered window parks/releases: the decoded snapshot plus the lag
+ * comp stamps its ORIGINAL packet carried. Parked frames must keep their own
+ * instant (a packet that fills a hole arrives with later frames' stamps), so
+ * stamps ride with the value through the window rather than alongside the
+ * live buffer queue.
+ *
+ * @internal
+ */
+export interface OrderedPayload<I = any> {
+  input: I;
+  renderTime: number;
+  reckonTime: number;
+}
+
 /** Shared zero-state "already done" iterator — returned by `consume()` on an
  *  empty buffer with no idle policy, and by the no-op accessor. Frozen + a frozen
  *  result, so it's allocation-free and safe to share across all callers. */
@@ -173,6 +189,14 @@ export class InputBufferImpl<I = any> {
   private readonly _client?: Pick<ClientPrivate, '_input'> & { sessionId: string };
   /** Room-level idle policy (`defineInput({ idle })`) — the bare-call default. */
   private readonly _roomIdle?: IdleInput<I>;
+
+  /**
+   * Ordered-window binding (opt-in sequenced reliable channel). When set,
+   * frames enter via {@link pushOrdered} — the window decides what is
+   * releasable — and the buffer is purely the in-order queue the sim drains.
+   * When unset, {@link push} appends in receive order (the legacy path).
+   */
+  private _window?: OrderedWindow;
   /** Reused synthesized idle frame + the schema's field names/defaults (lazy). */
   private _idle?: I;
   private _fieldNames?: string[];
@@ -180,13 +204,17 @@ export class InputBufferImpl<I = any> {
   /** Reused ctx for the idle callback form (see {@link IdleContext}). */
   private readonly _idleCtx: IdleContext<I> = { latest: undefined, sessionId: "" };
 
-  constructor(maxSize: number, seqField: string | undefined, ctor?: new () => I, client?: Pick<ClientPrivate, '_input'> & { sessionId: string }, idle?: IdleInput<I>) {
+  constructor(maxSize: number, seqField: string | undefined, ctor?: new () => I, client?: Pick<ClientPrivate, '_input'> & { sessionId: string }, idle?: IdleInput<I>, window?: OrderedWindow) {
     this._maxSize = maxSize;
     this._seqField = seqField;
     this._ctor = ctor;
     this._client = client;
     this._roomIdle = idle;
+    this._window = window;
   }
+
+  /** Whether this buffer is the ordered (sequenced reliable) queue. */
+  get ordered(): boolean { return this._window !== undefined; }
 
   /** The effective idle policy for one consume call: per-call `false` suppresses,
    *  per-call value overrides, else the room-level default (or none). */
@@ -250,6 +278,9 @@ export class InputBufferImpl<I = any> {
     if (this._seqs !== undefined) { this._lastConsumedSeq = this._seqs[i]; }
     this._head = i + 1;
     this.consumedCount++;
+    // Ordered channel: keep the window's consumption frontier (= the
+    // reconnect negotiation point) on the seq this sim just applied.
+    this._window?.markConsumed(this._seqs![i]);
     return this._items[i];
   }
 
@@ -262,6 +293,75 @@ export class InputBufferImpl<I = any> {
     this._reckonTimes.length = 0;
     if (this._seqs !== undefined) { this._seqs.length = 0; }
     this._head = 0;
+  }
+
+  /** Overflow: drop the oldest unconsumed slot and count it consumed so the ack
+   *  advances past it. Advance the cursor (don't shift) — O(1), {@link compact}
+   *  reclaims later. Ordered channel additionally records the dropped seq as the
+   *  window's consumption frontier (an input aged out of the sim queue is, from
+   *  the client's view, settled — it must not be replayed on reconnect). */
+  private dropOldestOverflow(): void {
+    if (this._seqs !== undefined) {
+      this._lastConsumedSeq = this._seqs[this._head]; // dropped oldest counts as acked
+      this._window?.markConsumed(this._seqs[this._head]);
+    }
+    this._head++;
+    this.consumedCount++;
+    this.compact();
+  }
+
+  /**
+   * Append one frame the ordered window just RELEASED. The frame is already
+   * in-order by construction — this is the sim-facing queue the window feeds,
+   * so no accept/reorder here. Carries the explicit seq parallel (ordered
+   * buffers always track {@link _seqs}) so the TIMED ack and
+   * {@link consumedCount} report the client's values, not a receive counter.
+   */
+  private orderedEnqueue(seq: number, snapshot: I, renderTime: number, reckonTime: number): void {
+    (this._seqs ??= []).push(seq);
+    this._items.push(snapshot);
+    this._renderTimes.push(renderTime);
+    this._reckonTimes.push(reckonTime);
+    if (this.size > this._maxSize) { this.dropOldestOverflow(); }
+  }
+
+  /**
+   * Admit a SEQUENCED reliable frame through the ordered window. The value
+   * parked/released is an {@link OrderedPayload} (snapshot + the stamps of the
+   * packet it arrived on — a parked frame keeps its OWN instant when a later
+   * packet unlocks it). The window decides duplicate / park / release; every
+   * released payload enters the sim queue in order. Returns the verdict.
+   */
+  pushOrdered(
+    seq: number,
+    payload: OrderedPayload<I>,
+  ): "release" | "park" | "duplicate" | "expired" {
+    const verdict = this._window!.admit(payload, seq);
+    if (verdict.kind === "duplicate" || verdict.kind === "park") { return verdict.kind; }
+    for (const released of verdict.chain) {
+      const packed = released.value as OrderedPayload<I>;
+      this.orderedEnqueue(
+        released.seq,
+        packed.input,
+        packed.renderTime,
+        packed.reckonTime,
+      );
+    }
+    return verdict.kind;
+  }
+
+  /**
+   * Release whatever the window aged out this tick (gap expiry). Called from
+   * the fixed-step loop BEFORE the sim consumes, so expired chains are
+   * eligible in the same tick they became due. Released frames are already
+   * in-order by the window's construction.
+   */
+  releaseExpired(now?: number): void {
+    if (this._window === undefined) { return; }
+    for (const released of this._window.sweep(now)) {
+      const packed = released.value as OrderedPayload<I>;
+      this.orderedEnqueue(released.seq, packed.input, packed.renderTime, packed.reckonTime);
+    }
   }
 
   /**
@@ -278,12 +378,7 @@ export class InputBufferImpl<I = any> {
     if (seq !== undefined) { (this._seqs ??= []).push(seq); }
     // Overflow drops the oldest unconsumed input; count it consumed so the ack
     // still advances past it. Advance the cursor (don't shift) — keeps it O(1).
-    if (this.size > this._maxSize) {
-      if (this._seqs !== undefined) { this._lastConsumedSeq = this._seqs[this._head]; } // dropped oldest counts as acked
-      this._head++;
-      this.consumedCount++;
-      this.compact();
-    }
+    if (this.size > this._maxSize) { this.dropOldestOverflow(); }
   }
 
   /** Reclaim the consumed prefix `[0, _head)`. Free when fully drained (reuse the
@@ -321,7 +416,12 @@ export class InputBufferImpl<I = any> {
     const last = this._items.length - 1;
     this._lastRenderTime = this._renderTimes[last]; // drain reports the NEWEST stamps
     this._lastReckonTime = this._reckonTimes[last];
-    if (this._seqs !== undefined) { this._lastConsumedSeq = this._seqs[last]; }
+    if (this._seqs !== undefined) {
+      this._lastConsumedSeq = this._seqs[last];
+      // Ordered: the whole batch is applied now — keep the window's
+      // consumption frontier (= reconnect negotiation point) on its newest seq.
+      this._window?.markConsumed(this._seqs[last]!);
+    }
     // Hand off the backing array untouched when nothing was partially consumed
     // (O(1) — the caller may retain it); else copy out the unconsumed tail. Fresh
     // arrays here, NOT truncate(): drain already allocates the returned array, and
@@ -360,7 +460,10 @@ export class InputBufferImpl<I = any> {
     const out = this._items.slice(start, start + count);
     this._lastRenderTime = this._renderTimes[start + count - 1]; // newest taken input's stamps
     this._lastReckonTime = this._reckonTimes[start + count - 1];
-    if (this._seqs !== undefined) { this._lastConsumedSeq = this._seqs[start + count - 1]; }
+    if (this._seqs !== undefined) {
+      this._lastConsumedSeq = this._seqs[start + count - 1];
+      this._window?.markConsumed(this._seqs[start + count - 1]!);
+    }
     this._head += count;
     this.consumedCount += count;
     this.compact();
@@ -499,6 +602,20 @@ export class InputBufferImpl<I = any> {
   }
 
   clear(): void {
+    if (this._window !== undefined) {
+      // Ordered freeze (seat dropped for reconnect). The window's consumption
+      // frontier is kept current by the consume primitives (next/take/drain/
+      // iterate all mark it), so reset collapses the release frontier to
+      // exactly what the sim applied — released-but-unsimulated queued inputs
+      // and parked successors are NOT settled and the client re-sends them
+      // above the negotiated point. Drop the queue; no ack/count bump here.
+      this.truncate();
+      this._window.reset();
+      this._iterActive = false;
+      this._iterRemaining = 0;
+      this._iterIdle = undefined;
+      return;
+    }
     // Cleared inputs count as consumed: advance both the count and the seq-value ack
     // past them so the client's pending set drains (capture the newest seq before truncate).
     if (this._seqs !== undefined && this._items.length > 0) { this._lastConsumedSeq = this._seqs[this._items.length - 1]; }
@@ -542,6 +659,8 @@ export class InputAccessorImpl<I = any> implements InputAccessor<I> {
   take(n: number): I[] { return (this._client._inputBuffer?.take(n) ?? []) as I[]; }
   peek(): I[] { return (this._client._inputBuffer?.peek() ?? []) as I[]; }
   get size(): number { return this._client._inputBuffer?.size ?? 0; }
+  /** @internal Ordered-channel gap-expiry tick (RoomInput.tick). */
+  releaseExpired(now?: number): void { this._client._inputBuffer?.releaseExpired(now); }
   get consumedCount(): number { return this._client._inputBuffer?.consumedCount ?? 0; }
   get wasIdle(): boolean { return this._client._inputBuffer?.wasIdle ?? false; }
   clear(): void { this._client._inputBuffer?.clear(); }

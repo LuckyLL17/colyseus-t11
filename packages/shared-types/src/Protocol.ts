@@ -128,6 +128,24 @@ export const ProtocolModifier = {
   TIMED: 0x80,
 
   /**
+   * The client→server RELIABLE input frame carries an explicit application
+   * sequence number and opts into the server's ordered receive window:
+   *
+   *     [code | SEQUENCED][varint seq][stamp?][...body]
+   *
+   * Only valid on {@link Protocol.ROOM_INPUT_RELIABLE}. The server parks
+   * out-of-order frames in a bounded window and releases them (in order) only
+   * once the gap fills or ages out past the room's `reliable.maxGapAgeMs`,
+   * so a side-effectful input is never applied twice nor behind a hole. The
+   * seq echoed by the TIMED state prefix is then the last-CONFIRMED value.
+   *
+   * Absent (legacy clients, or `mode:"unreliable"` which has framework seqs
+   * of its own), frames are captured straight to the input buffer as they
+   * arrive — the original count-based path, unchanged.
+   */
+  SEQUENCED: 0x20,
+
+  /**
    * The frame rode the transport's UNRELIABLE channel (a WebTransport datagram)
    * and may therefore be lost, duplicated, or reordered.
    *
@@ -159,8 +177,9 @@ export type ProtocolModifier = typeof ProtocolModifier[keyof typeof ProtocolModi
 /** Mask isolating the base protocol code (low 5 bits, values 0..31). */
 export const PROTOCOL_CODE_MASK = 0x1F;
 
-/** Mask isolating modifier bits (high 3 bits; {@link ProtocolModifier.TIMED} and
- *  {@link ProtocolModifier.UNRELIABLE} are assigned, the third is reserved). */
+/** Mask isolating modifier bits (high 3 bits; {@link ProtocolModifier.TIMED},
+ *  {@link ProtocolModifier.UNRELIABLE}, and {@link ProtocolModifier.SEQUENCED}
+ *  are assigned). */
 export const PROTOCOL_MODIFIER_MASK = 0xE0;
 
 /**
@@ -247,6 +266,22 @@ export const InputFlags = {
    *  {@link RENDER_TIME} the input ships `[varint Δreckon][uint16 renderDelta]`;
    *  alone it ships `[varint Δreckon]`. See {@link ProtocolModifier.TIMED}. */
   RECKON_TIME: 1 << 4,
+  /** Reliable inputs carry an explicit seq and the server parks/orders them in
+   *  a bounded per-session receive window (`defineInput({ reliable })`). The
+   *  client SDK then tags every RELIABLE input with
+   *  {@link ProtocolModifier.SEQUENCED}, replays the unacked set in order after
+   *  a reconnect, and ignores the legacy count path. Absent ⇒ legacy behavior:
+   *  inputs are applied in transport-receive order and the ack is a count. A
+   *  trailing `[receiveWindow varint]` follows when set (the window's capacity
+   *  in seqs). */
+  SEQUENCED: 1 << 5,
+  /** A `[reconnectAck varint]` follows — present ONLY in the JOIN_ROOM
+   *  handshake of a session RECONNECTING under {@link SEQUENCED}: the last seq
+   *  the server confirmed before the seat dropped. The client adopts it as the
+   *  reconciliation point and re-sends every sent-but-unacked input above it.
+   *  Fresh joins omit the flag; legacy clients ignore it (unknown flag skipped
+   *  via section length). */
+  RECONNECT_ACK: 1 << 6,
 } as const;
 export type InputFlags = typeof InputFlags[keyof typeof InputFlags];
 

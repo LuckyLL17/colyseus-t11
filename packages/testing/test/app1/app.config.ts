@@ -9,6 +9,7 @@ import { RoomWithoutState } from "./RoomWithoutState.ts";
 import { RoomWithState } from "./RoomWithState.ts";
 import { RoomWithSimulation } from "./RoomWithSimulation.ts";
 import { RoomWithFixedTimestep } from "./RoomWithFixedTimestep.ts";
+import { SequencedInputRoom } from "./SequencedInputRoom.ts";
 import { auth, Hash } from "@colyseus/auth";
 
 export default config({
@@ -17,6 +18,7 @@ export default config({
     room_with_state: defineRoom(RoomWithState),
     room_with_simulation: defineRoom(RoomWithSimulation),
     room_with_fixed_timestep: defineRoom(RoomWithFixedTimestep),
+    sequenced_input: defineRoom(SequencedInputRoom),
   },
 
   options: { greet: false, },

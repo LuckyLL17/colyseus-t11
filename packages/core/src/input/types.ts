@@ -143,6 +143,49 @@ export interface DefineInputOptions<I = any> {
    * instead — pass it here only when the room runs its own loop.
    */
   subSteps?: number;
+  /**
+   * Opt-in sequenced, ack-confirmed RELIABLE input channel. Pass an object to
+   * enable; omit it for the legacy path (reliable inputs applied in receive
+   * order, ack is a consume count — unchanged for old clients).
+   *
+   * When enabled the server:
+   * - advertises {@link InputFlags.SEQUENCED} (+ the receive window) in the
+   *   join handshake; SDK clients then tag every reliable input with an
+   *   explicit seq (`ProtocolModifier.SEQUENCED`),
+   * - parks out-of-order frames in a bounded per-session window and releases
+   *   them ONLY in seq order — duplicate deliveries (transport redelivery /
+   *   reconnect replay) are dropped, so a side-effectful input applies once,
+   * - stops waiting on a gap once it is older than {@link ReliableInputOptions.maxGapAgeMs}
+   *   (or exceeds the window), declaring the missing seqs lost, so an expired
+   *   sequence can't stall the fixed-step loop,
+   * - negotiates ONLY the last-consumed ack point with the client on
+   *   reconnect (`InputFlags.RECONNECT_ACK`); the client replays the inputs
+   *   above it.
+   *
+   * Unreliable (`mode:"unreliable"`) inputs are unaffected — their framework
+   * wire seqs and redundancy ring keep the existing path.
+   */
+  reliable?: ReliableInputOptions;
+}
+
+/**
+ * Configuration for the sequenced reliable input channel — see
+ * {@link DefineInputOptions.reliable}.
+ */
+export interface ReliableInputOptions {
+  /**
+   * Capacity of the per-session receive window, in seqs (default 64). A frame
+   * arriving more than this far ahead of the confirmed frontier force-expires
+   * the intervening gap rather than growing the park without bound.
+   */
+  windowSize?: number;
+  /**
+   * Max milliseconds the fixed-step loop waits for the missing predecessors of
+   * a parked frame before declaring them lost (default 1000). After this, the
+   * gap is skipped on the next sim tick and the parked run behind it is
+   * released — the sim never blocks forever on an expired sequence.
+   */
+  maxGapAgeMs?: number;
 }
 
 /** `true` when the defineInput opts declared an `idle` policy — narrows the
@@ -229,6 +272,18 @@ export interface NormalizedInputOptions {
    * `latest` / the buffer / the idle ctx.
    */
   sanitize?: (instance: any) => void;
+
+  /**
+   * Normalized sequenced-reliable config (see
+   * {@link DefineInputOptions.reliable}). `undefined` ⇒ legacy count-based
+   * reliable path.
+   */
+  reliable?: {
+    /** Per-session ordered-window capacity (seqs). */
+    windowSize: number;
+    /** Gap expiry threshold (ms). */
+    maxGapAgeMs: number;
+  };
 }
 
 /**
