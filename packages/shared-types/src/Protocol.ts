@@ -153,14 +153,50 @@ export const ProtocolModifier = {
    * called `defineInput()`.
    */
   UNRELIABLE: 0x40,
+
+  /**
+   * The frame rides the RELIABLE input channel but carries an EXPLICIT,
+   * client-owned input seq — opt-in reliable-input sequencing
+   * (`defineInput({ reliableSequence: true })` on the server, advertised back
+   * to the client via the {@link InputFlags.RELIABLE_SEQUENCE} handshake flag).
+   *
+   * Layout when set on {@link Protocol.ROOM_INPUT_RELIABLE}:
+   *
+   *     [code | SEQUENCED | TIMED?][stamp prefix?][varint seq][...input body]
+   *
+   * The seq sits AFTER the optional TIMED stamp and BEFORE the schema body —
+   * the body decode still starts at `it.offset` once the prefixes are consumed.
+   *
+   * Semantics:
+   * - Seqs are 1-based and strictly increase per INPUT the application sends
+   *   (no implicit message counting — a client that skips a tick leaves a real
+   *   gap, which the server fills rather than invents an input for).
+   * - The server keeps, per session, the last ORDERED seq (its confirmation
+   *   point) and a bounded receive window. Duplicates (a seq already ordered)
+   *   are dropped BEFORE decode, so a resent input can never re-apply a side
+   *   effect; out-of-window / already-skipped seqs are dropped the same way; a
+   *   gap older than the window is SKIPPED — the missing inputs are declared
+   *   expired rather than waited on forever — and the contiguous tail is then
+   *   admitted in order.
+   * - On reconnect the two sides negotiate ONLY the last confirmation point
+   *   ({@link InputFlags.LAST_ACK} + the server's last-ordered seq in the join
+   *   handshake); the client then replays, in seq order, exactly the inputs
+   *   above that point it still holds, and continues numbering from there.
+   *
+   * Absence of the bit ⇒ the legacy implicit receive-count sequencing (old
+   * clients, rooms that didn't opt in): every decoded frame is admitted in
+   * arrival order and the ack is a plain consumed count. Never set on the
+   * unreliable opcode (that channel keeps its own framework wire seq).
+   */
+  SEQUENCED: 0x20,
 } as const;
 export type ProtocolModifier = typeof ProtocolModifier[keyof typeof ProtocolModifier];
 
 /** Mask isolating the base protocol code (low 5 bits, values 0..31). */
 export const PROTOCOL_CODE_MASK = 0x1F;
 
-/** Mask isolating modifier bits (high 3 bits; {@link ProtocolModifier.TIMED} and
- *  {@link ProtocolModifier.UNRELIABLE} are assigned, the third is reserved). */
+/** Mask isolating modifier bits (high 3 bits; {@link ProtocolModifier.TIMED},
+ *  {@link ProtocolModifier.UNRELIABLE} and {@link ProtocolModifier.SEQUENCED}). */
 export const PROTOCOL_MODIFIER_MASK = 0xE0;
 
 /**
@@ -209,9 +245,10 @@ export const HandshakeSection = {
   /**
    * Input feature flags + optional values the client mirrors — present when the
    * Room called `defineInput()`. Layout:
-   * `[flags uint8][tickRate varint?][patchRate varint?][subSteps varint?]`,
+   * `[flags uint8][tickRate varint?][patchRate varint?][subSteps varint?][lastAck varint?]`,
    * bits per {@link InputFlags}; trailing varints appear in flag-bit order
-   * when set.
+   * (the `lastAck` varint appears only on a reconnection handshake carrying
+   * {@link InputFlags.LAST_ACK}).
    */
   INPUT_OPTIONS: 2,
 } as const;
@@ -247,6 +284,29 @@ export const InputFlags = {
    *  {@link RENDER_TIME} the input ships `[varint Δreckon][uint16 renderDelta]`;
    *  alone it ships `[varint Δreckon]`. See {@link ProtocolModifier.TIMED}. */
   RECKON_TIME: 1 << 4,
+  /**
+   * Opt-in reliable-input sequencing (`defineInput({ reliableSequence: true
+   * })`). When set, the client numbers every reliable input with its own
+   * 1-based monotonic seq and sends it on the wire behind
+   * {@link ProtocolModifier.SEQUENCED} (`[stamp?][varint seq][body]`); the
+   * server deduplicates against a per-session confirmation point inside a
+   * bounded receive window, orders gapped delivery, and expires stale gaps.
+   * Absent (rooms that didn't opt in, and always for the unreliable channel)
+   * the seq stays implicit in the message count — legacy clients send no bit
+   * and are admitted exactly as before. No trailing varint: capability only.
+   */
+  RELIABLE_SEQUENCE: 1 << 5,
+  /**
+   * A `[lastAck varint]` follows in the same section — present ONLY on the
+   * handshake that confirms a RECONNECTION. It carries the server's last
+   * ORDERED (confirmed) seq for this session at freeze time: the single value
+   * the two sides negotiate. The client adopts it as the baseline, drops every
+   * replay entry `<= lastAck` (already reflected in / finished influencing the
+   * authoritative state — never re-applied), replays the still-pending inputs
+   * above it in seq order, and continues numbering from its own high-water
+   * mark. Absent on a first join ⇒ lastAck 0.
+   */
+  LAST_ACK: 1 << 6,
 } as const;
 export type InputFlags = typeof InputFlags[keyof typeof InputFlags];
 

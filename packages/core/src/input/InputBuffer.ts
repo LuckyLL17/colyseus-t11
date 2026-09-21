@@ -146,6 +146,22 @@ export class InputBufferImpl<I = any> {
    *  path pays nothing). A buffer is single-mode, so this is either never created
    *  (reliable) or created once and kept parallel (unreliable). */
   private _seqs?: number[];
+  /** Explicit client-owned seq per buffered input (parallel to `_items`) — the
+   *  SEQUENCED reliable channel ONLY, created up front in that mode. Its
+   *  values may be NON-contiguous across slots: expired seqs are represented
+   *  by `undefined` items pushed via {@link pushGap}, and this array records
+   *  the seq each slot occupies. */
+  private _orderedSeqs?: number[];
+  /** Whether this buffer runs the explicit-seq reliable mode (SEQUENCED). In
+   *  this mode the ack value ({@link ackSeq}) is the seq of the last slot the
+   *  consumption cursor PASSED — a contiguous, "fully done" prefix (gaps
+   *  included) — not a consumed count; {@link consumedCount} mirrors it
+   *  (initialized to the negotiated last ack on reconnect). */
+  private readonly _explicit: boolean;
+  /** Explicit mode only: count of REAL (non-gap) unconsumed slots — backs the
+   *  O(1) {@link size} getter and the consume-iterator remaining count, so the
+   *  expired-gap markers (pushed via {@link pushGap}) don't read as inputs. */
+  private _pendingReal = 0;
   /** Seq VALUE of the last consumed input — the reconciliation ack echoed to the
    *  client (see {@link ackSeq}). Only meaningful when {@link _seqs} is tracked
    *  (unreliable); reliable's ack falls back to {@link consumedCount}. */
@@ -180,12 +196,20 @@ export class InputBufferImpl<I = any> {
   /** Reused ctx for the idle callback form (see {@link IdleContext}). */
   private readonly _idleCtx: IdleContext<I> = { latest: undefined, sessionId: "" };
 
-  constructor(maxSize: number, seqField: string | undefined, ctor?: new () => I, client?: Pick<ClientPrivate, '_input'> & { sessionId: string }, idle?: IdleInput<I>) {
+  constructor(maxSize: number, seqField: string | undefined, ctor?: new () => I, client?: Pick<ClientPrivate, '_input'> & { sessionId: string }, idle?: IdleInput<I>, explicit?: boolean, initialSeq: number = 0) {
     this._maxSize = maxSize;
     this._seqField = seqField;
     this._ctor = ctor;
     this._client = client;
     this._roomIdle = idle;
+    this._explicit = explicit === true;
+    if (this._explicit) {
+      // Explicit mode: track each item's client seq (gaps included) and start
+      // the ack at the negotiated confirmation point (0 on a fresh join).
+      this._orderedSeqs = [];
+      this._lastConsumedSeq = initialSeq >>> 0;
+      this.consumedCount = this._lastConsumedSeq;
+    }
   }
 
   /** The effective idle policy for one consume call: per-call `false` suppresses,
@@ -247,10 +271,51 @@ export class InputBufferImpl<I = any> {
     this._lastWasIdle = false;
     this._lastRenderTime = this._renderTimes[i];
     this._lastReckonTime = this._reckonTimes[i];
-    if (this._seqs !== undefined) { this._lastConsumedSeq = this._seqs[i]; }
-    this._head = i + 1;
-    this.consumedCount++;
+    if (this._orderedSeqs !== undefined) {
+      const s = this._orderedSeqs[i];
+      // A buffered slot always carries an explicit seq (gap slots push a seq too).
+      this._lastConsumedSeq = s;
+      this.consumedCount = s;
+      if (this._items[i] !== undefined) { this._pendingReal--; }
+      this._head = i + 1;
+      // Consuming a REAL slot extends the fully-done prefix over every ADJACENT
+      // expired-gap slot behind it: a skipped seq has no predecessor left to
+      // wait on once the slot before it is consumed, so the ack runs forward
+      // to the next unconsumed REAL slot (or the tail). The sim still never
+      // sees the gap (no yield); only the confirmation point advances.
+      while (this._head < this._items.length && this._items[this._head] === undefined) {
+        this._lastConsumedSeq = this._orderedSeqs[this._head];
+        this.consumedCount = this._lastConsumedSeq;
+        this._head++;
+      }
+    } else if (this._seqs !== undefined) {
+      this._lastConsumedSeq = this._seqs[i];
+      this._head = i + 1;
+      this.consumedCount++;
+    } else {
+      this._head = i + 1;
+      this.consumedCount++;
+    }
     return this._items[i];
+  }
+
+  /** Explicit mode: transparently advance the cursor over expired-gap slots
+   *  (`undefined` items) at the HEAD — the sim never observes them, but moving
+   *  the cursor past a head gap EXTENDS the fully-done prefix (every earlier
+   *  slot is consumed by definition — the head is the oldest unconsumed one),
+   *  so the ack advances to the gap's seq. Reclaims the prefix in bulk like
+   *  {@link compact}. Returns true when at least one slot was reclaimed. */
+  private skipGapHead(): boolean {
+    if (this._orderedSeqs === undefined) { return false; }
+    let advanced = false;
+    while (this._head < this._items.length && this._items[this._head] === undefined) {
+      this._lastConsumedSeq = this._orderedSeqs[this._head];
+      this.consumedCount = this._lastConsumedSeq;
+      this._head++;
+      advanced = true;
+    }
+    if (advanced) { this.compact(); }
+    return advanced;
   }
 
   /** Drop ALL slots, reusing the backing arrays' capacity — the zero-GC reset for
@@ -261,6 +326,7 @@ export class InputBufferImpl<I = any> {
     this._renderTimes.length = 0;
     this._reckonTimes.length = 0;
     if (this._seqs !== undefined) { this._seqs.length = 0; }
+    if (this._orderedSeqs !== undefined) { this._orderedSeqs.length = 0; }
     this._head = 0;
   }
 
@@ -286,6 +352,58 @@ export class InputBufferImpl<I = any> {
     }
   }
 
+  /**
+   * Append an ORDERED snapshot admitted by the explicit-seq reliable policy
+   * ({@link ReliableSequencer}). The caller has already proven this is the
+   * next contiguous seq, so no dedupe happens here — ordering/duplicates are
+   * the sequencer's job. The ack value tracks the EXPLICIT seq (not a receive
+   * count), so it matches what the client numbered the input regardless of
+   * gaps and reconnects.
+   */
+  pushOrdered(snapshot: I, orderedSeq: number, renderTime: number = 0, reckonTime: number = 0): void {
+    this._items.push(snapshot);
+    this._renderTimes.push(renderTime);
+    this._reckonTimes.push(reckonTime);
+    this._orderedSeqs!.push(orderedSeq >>> 0);
+    this._pendingReal++;
+    // Bound the BUFFER on the total unconsumed slot count (real + gap), so a
+    // replay/expiry burst can't grow it without limit.
+    if (this.totalSlots > this._maxSize) { this.dropHeadOverflow(); }
+  }
+
+  /**
+   * Record an SKIPPED seq (an expired receive-window gap) as an `undefined`
+   * slot. The ack does NOT move here: it tracks the contiguous FULLY-DONE
+   * prefix, and an unconsumed REAL slot earlier in the array would sit behind
+   * this gap — jumping the ack over it would tell the client an input was
+   * processed when the sim hasn't run it yet. The marker advances the ack
+   * only when the consumption cursor PASSES it ({@link stepHead}), which can
+   * happen once every earlier slot is consumed. Consumers never observe the
+   * marker ({@link skipGapHead} / the consume walks skip it).
+   */
+  pushGap(orderedSeq: number): void {
+    this._items.push(undefined as unknown as I);
+    this._renderTimes.push(0);
+    this._reckonTimes.push(0);
+    this._orderedSeqs!.push(orderedSeq >>> 0);
+    if (this.totalSlots > this._maxSize) { this.dropHeadOverflow(); }
+  }
+
+  /** Explicit-mode overflow: drop slots at the HEAD (oldest first, real or
+   *  gap) until the total unconsumed slot count fits. Dropping an unconsumed
+   *  REAL slot marks it expired (never going to be simulated) — the cursor
+   *  moves over it, and the ack lands on the last dropped slot's seq. */
+  private dropHeadOverflow(): void {
+    while (this.totalSlots > this._maxSize) {
+      const wasReal = this._items[this._head] !== undefined;
+      this._lastConsumedSeq = this._orderedSeqs![this._head];
+      this.consumedCount = this._lastConsumedSeq;
+      this._head++;
+      if (wasReal) { this._pendingReal--; }
+    }
+    this.compact();
+  }
+
   /** Reclaim the consumed prefix `[0, _head)`. Free when fully drained (reuse the
    *  arrays); otherwise splice only once the cursor passes {@link COMPACT_THRESHOLD},
    *  so the amortized per-input cost stays O(1). */
@@ -298,6 +416,7 @@ export class InputBufferImpl<I = any> {
       this._renderTimes.splice(0, this._head);
       this._reckonTimes.splice(0, this._head);
       if (this._seqs !== undefined) { this._seqs.splice(0, this._head); }
+      if (this._orderedSeqs !== undefined) { this._orderedSeqs.splice(0, this._head); }
       this._head = 0;
     }
   }
@@ -310,14 +429,36 @@ export class InputBufferImpl<I = any> {
   }
 
   drain(opts?: ConsumeOptions<I>): I[] {
+    // Explicit mode: reclaim any expired-gap markers at the head first (they are
+    // not inputs), so a gap-only buffer correctly reads as empty (idle policy).
+    if (this._orderedSeqs !== undefined) { this.skipGapHead(); }
     // Empty: synthesize one idle frame (NOT consumed — no ack bump, stamps
     // untouched) when a policy is in effect, else [].
     if (this.size === 0) {
       const idle = this.idleFrameOnEmpty(opts);
       this._lastWasIdle = idle !== undefined;
-      return idle !== undefined ? [idle] : [];
+      return idle !== null && idle !== undefined ? [idle] : [];
     }
     this._lastWasIdle = false;
+    // Explicit mode: gather the REAL slots only (gap markers are skipped, never
+    // handed to the sim). The ack ends on the LAST slot's seq — real or gap — so
+    // it never jumps backward past a trailing gap.
+    if (this._orderedSeqs !== undefined) {
+      const out: I[] = [];
+      for (let i = this._head; i < this._items.length; i++) {
+        const item = this._items[i];
+        this._lastConsumedSeq = this._orderedSeqs[i];
+        this.consumedCount = this._lastConsumedSeq;
+        if (item !== undefined) {
+          this._lastRenderTime = this._renderTimes[i]; // newest REAL input's stamps
+          this._lastReckonTime = this._reckonTimes[i];
+          out.push(item);
+        }
+      }
+      this._pendingReal = 0;
+      this.truncate();
+      return out;
+    }
     const last = this._items.length - 1;
     this._lastRenderTime = this._renderTimes[last]; // drain reports the NEWEST stamps
     this._lastReckonTime = this._reckonTimes[last];
@@ -340,6 +481,7 @@ export class InputBufferImpl<I = any> {
   /** Consume the single oldest input (ack advances by one); `undefined` if
    *  empty — or the synthesized idle frame when an idle policy is in effect. */
   next(opts?: ConsumeOptions<I>): I | undefined {
+    if (this._orderedSeqs !== undefined) { this.skipGapHead(); }
     if (this.size === 0) {
       const idle = this.idleFrameOnEmpty(opts);
       this._lastWasIdle = idle !== undefined;
@@ -353,9 +495,21 @@ export class InputBufferImpl<I = any> {
   /** Consume up to `n` oldest inputs (ack advances by the count actually taken). */
   take(n: number): I[] {
     this._lastWasIdle = false; // take never synthesizes idle
+    if (this._orderedSeqs !== undefined) { this.skipGapHead(); }
     const avail = this.size;
     if (n <= 0 || avail === 0) { return []; }
     const count = Math.min(n, avail);
+    if (this._orderedSeqs !== undefined) {
+      // Walk slots through stepHead (it crosses expired-gap markers and moves
+      // the ack for them); collect only the REAL inputs up to `count`.
+      const out: I[] = [];
+      while (out.length < count && this.size > 0) {
+        const item = this.stepHead();
+        if (item !== undefined) { out.push(item); }
+      }
+      this.compact();
+      return out;
+    }
     const start = this._head;
     const out = this._items.slice(start, start + count);
     this._lastRenderTime = this._renderTimes[start + count - 1]; // newest taken input's stamps
@@ -382,6 +536,9 @@ export class InputBufferImpl<I = any> {
    * both share the cursor — but it must not corrupt).
    */
   consume(opts?: ConsumeOptions<I>): IterableIterator<I> {
+    // Explicit mode: reclaim expired-gap markers at the head so the pass counts
+    // and yields only REAL inputs (gap slots are skipped, never iterated).
+    if (this._orderedSeqs !== undefined) { this.skipGapHead(); }
     const empty = this.size === 0;
     const idle = empty ? this.idleFrameOnEmpty(opts) : undefined;
     if (empty && idle === undefined) { this._lastWasIdle = false; return DONE_ITERATOR as IterableIterator<I>; }
@@ -417,6 +574,8 @@ export class InputBufferImpl<I = any> {
     this._iter = {
       [Symbol.iterator]() { return this; },
       next(): IteratorResult<I> {
+        // After consume()'s skipGapHead and stepHead's own trailing-gap walk,
+        // the cursor always points at a REAL slot (or the tail) when size > 0.
         // `size > 0` re-checks the live tail: a mid-loop next()/take()/clear()
         // can only shorten the pass, never make it read past the end.
         if (self._iterRemaining > 0 && self.size > 0) {  // a buffered input
@@ -442,7 +601,7 @@ export class InputBufferImpl<I = any> {
   /** Re-entrant fallback: a fresh generator for a nested `consume()` of this same
    *  buffer (the pooled iterator is single-active). Same accounting + compaction. */
   private *consumeGen(idleFrame: I | undefined): IterableIterator<I> {
-    let remaining = this.size;   // count-based walk, same reason as the pooled pass
+    let remaining = this.size;   // REAL inputs to walk (stepHead crosses gaps)
     try {
       while (remaining-- > 0 && this.size > 0) { yield this.stepHead(); }
       if (idleFrame !== undefined) { this._lastWasIdle = true; yield idleFrame; }
@@ -452,18 +611,39 @@ export class InputBufferImpl<I = any> {
   }
 
   peek(): I[] {
+    if (this._orderedSeqs !== undefined) {
+      // Explicit mode: hide the expired-gap markers (undefined slots).
+      const out: I[] = [];
+      for (let i = this._head; i < this._items.length; i++) {
+        if (this._items[i] !== undefined) { out.push(this._items[i]); }
+      }
+      return out;
+    }
     return this._items.slice(this._head);
   }
 
   at(value: number): I | undefined {
     if (this._seqField === undefined) { return undefined; }
     for (let i = this._head; i < this._items.length; i++) {
-      if ((this._items[i] as any)[this._seqField] === value) { return this._items[i]; }
+      const item = this._items[i];
+      if (item !== undefined && (item as any)[this._seqField] === value) { return item; }
     }
     return undefined;
   }
 
+  /** Number of REAL (non-gap) unconsumed snapshots buffered — what the sim can
+   *  consume. Explicit mode maintains an O(1) counter ({@link _pendingReal}),
+   *  since expired-gap markers share the backing array; other modes are a
+   *  length difference. */
   get size(): number {
+    return this._orderedSeqs !== undefined ? this._pendingReal : this._items.length - this._head;
+  }
+
+  /** Explicit mode only: total unconsumed SLOTS (real inputs + expired-gap
+   *  markers) — the value the buffer's overflow bound is checked against, so a
+   *  burst of expired gaps can't grow the backing array past maxSize.
+   *  Identical to {@link size} in the other modes. */
+  get totalSlots(): number {
     return this._items.length - this._head;
   }
 
@@ -484,13 +664,18 @@ export class InputBufferImpl<I = any> {
     return this._lastReckonTime;
   }
 
-  /** Seq VALUE of the last consumed input — the reconciliation ack sent to the
-   *  client. Reliable (no wire seq tracked): falls back to {@link consumedCount}
-   *  for free. Unreliable: the framework wire seq, so a fully-dropped input doesn't
-   *  make the ack lag the client's sent seq by the lost count. `0` before the first
-   *  consume. */
+  /** Seq VALUE of the last consumed/ordered input — the reconciliation ack sent
+   *  to the client.
+   *  - Explicit-seq reliable (SEQUENCED): the last ORDERED seq (gap-aware,
+   *  reconnect-continuous) tracked in `_orderedSeqs` / `_lastConsumedSeq`.
+   *  - Unreliable: the framework wire seq, so a fully-dropped input doesn't make
+   *  the ack lag the client's sent seq by the lost count.
+   *  - Legacy reliable: falls back to {@link consumedCount} for free.
+   *  `0` before the first order/consume. */
   get ackSeq(): number {
-    return this._seqs !== undefined ? this._lastConsumedSeq : this.consumedCount;
+    return (this._orderedSeqs !== undefined || this._seqs !== undefined)
+      ? this._lastConsumedSeq
+      : this.consumedCount;
   }
 
   /** Whether the most recently produced frame was a synthesized idle (see {@link wasIdle}). */
@@ -499,12 +684,21 @@ export class InputBufferImpl<I = any> {
   }
 
   clear(): void {
-    // Cleared inputs count as consumed: advance both the count and the seq-value ack
-    // past them so the client's pending set drains (capture the newest seq before truncate).
-    if (this._seqs !== undefined && this._items.length > 0) { this._lastConsumedSeq = this._seqs[this._items.length - 1]; }
-    this.consumedCount += this.size;
-    this.truncate();
-    this._lastSeq = -Infinity;
+    // Explicit mode: the buffer drops pending inputs (a frozen seat idles) but
+    // the confirmation point SURVIVES — it is the per-session value negotiated
+    // on reconnect. Keep _lastConsumedSeq/consumedCount; the new buffer created
+    // on rejoin restarts from the same seq.
+    if (this._orderedSeqs !== undefined) {
+      this.truncate();
+      this._pendingReal = 0;
+    } else {
+      // Cleared inputs count as consumed: advance both the count and the seq-value ack
+      // past them so the client's pending set drains (capture the newest seq before truncate).
+      if (this._seqs !== undefined && this._items.length > 0) { this._lastConsumedSeq = this._seqs[this._items.length - 1]; }
+      this.consumedCount += this.size;
+      this.truncate();
+      this._lastSeq = -Infinity;
+    }
     this._iterActive = false; // recovery hatch if a consume() iterator was abandoned unclosed
     this._iterRemaining = 0;  // an abandoned iterator must not consume post-clear pushes
     this._iterIdle = undefined;

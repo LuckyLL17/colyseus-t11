@@ -1669,12 +1669,17 @@ export class Room<T extends RoomOptions = RoomOptions> {
     connectionOptions?: { reconnectionToken?: string, skipHandshake?: boolean }
   ) {
     const sessionId = client.sessionId;
+    // Set on the reconnection branch (before the handshake is built): drives
+    // the explicit-seq LAST_ACK negotiation.
+    let isReconnect = false;
 
     // generate unique private reconnection token
     // (each new reconnection receives a new reconnection token)
     client.reconnectionToken = generateId();
 
     // Allocate per-client input state early so onJoin can read inputs.get(sid).latest.
+    // The explicit-seq confirmation point is restored just below once we know
+    // whether this is a reconnection (a fresh join starts at 0).
     this._inputController?.allocate(client);
 
     if (this._reservedSeatTimeouts[sessionId]) {
@@ -1746,10 +1751,14 @@ export class Room<T extends RoomOptions = RoomOptions> {
     if (isWaitingReconnection) {
       const reconnectionToken = connectionOptions?.reconnectionToken;
       if (reconnectionToken && this._reconnections[reconnectionToken]?.[0] === sessionId) {
+        isReconnect = true;
         this.clients.push(client);
         // After push (no leak on a failed join), before onReconnect; overwrites
         // the dropped session's stale entry.
         this._inputController?.register(sessionId, client);
+        // Restore the explicit-seq channel to the session's frozen confirmation
+        // point — the only value reconnection negotiates.
+        this._inputController?.restoreSession(client, sessionId);
 
         //
         // await for reconnection:
@@ -1879,8 +1888,9 @@ export class Room<T extends RoomOptions = RoomOptions> {
 
       // NOT gated by skipHandshake: that flag means "client already has the STATE
       // schema", but these carry input config the client can't derive locally
-      // (re-parsing on reconnect is idempotent).
-      const extraSections = this._inputController?.handshakeSections();
+      // (re-parsing on reconnect is idempotent — on an explicit-seq reconnect the
+      // section also carries the negotiated LAST_ACK).
+      const extraSections = this._inputController?.handshakeSections(client, isReconnect);
 
       // confirm room id that matches the room name requested to join
       client.raw(getMessageBytes[Protocol.JOIN_ROOM](
@@ -2323,7 +2333,7 @@ export class Room<T extends RoomOptions = RoomOptions> {
 
     // Freeze the seat: a held (reconnecting) session idles from the first tick
     // instead of replaying last-known moves.
-    this._inputController?.freeze(client as unknown as ClientPrivate);
+    this._inputController?.freeze(client as unknown as ClientPrivate, client.sessionId);
 
     if (method) {
       debugMatchMaking(`${method.name}, sessionId: \'%s\' (close code: %d, roomId: %s)`, client.sessionId, code, this.roomId);

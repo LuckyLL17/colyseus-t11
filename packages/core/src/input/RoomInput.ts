@@ -1,4 +1,4 @@
-import { decode, encode, Encoder, Reflection, type Iterator } from '@colyseus/schema';
+import { decode, Decoder, encode, Encoder, Reflection, type Iterator } from '@colyseus/schema';
 import { InputDecoder } from '@colyseus/schema/input';
 import { HandshakeSection, InputFlags, ProtocolModifier } from '@colyseus/shared-types';
 
@@ -6,6 +6,7 @@ import {
   InputAccessorImpl, InputBufferImpl, NO_OP_INPUT_ACCESSOR,
   compileSanitizer, seedInputZeroValues, validateSubSteps,
 } from './InputBuffer.ts';
+import { ReliableSequencer } from './ReliableSequencer.ts';
 import type {
   InputAccessor, InputAPI, NormalizedInputOptions,
   DefineInputOptions, IdleDeclared,
@@ -97,6 +98,14 @@ export class RoomInput {
    *  {@link InputAPIImpl.get} (hence not `private`). */
   readonly accessors: Map<string, InputAccessor<any>> = new Map();
 
+  /** sessionId → last ORDERED (confirmed) seq for the explicit-seq reliable
+   *  channel. Unlike {@link accessors} this maps the SESSION, not the
+   *  connection: the value is captured at freeze (leave) and consumed at
+   *  rejoin so a reconnecting sequencer restarts exactly at the confirmation
+   *  point the old connection reached — "重连时双方只协商最后确认点". Only
+   *  populated in {@link options.reliableSequence} mode. */
+  private readonly sessionAcks: Map<string, number> = new Map();
+
   // Wire stamp mode derived from the rewind timeline, resolved once on first
   // handshake/decode then frozen so advertise + decode never disagree mid-session:
   // the renderTime/reckonTime prefix per input.
@@ -150,6 +159,12 @@ export class RoomInput {
       sanitize: opts?.sanitize !== undefined ? compileSanitizer(opts.sanitize) : undefined,
       tickRate,
       subSteps: validateSubSteps(opts?.subSteps, 'defineInput'),
+      // Explicit-seq reliable channel is opt-in (see DefineInputOptions): off by
+      // default so legacy clients/rooms keep the implicit receive-count path.
+      reliableSequence: opts?.reliableSequence === true,
+      reliableWindow: opts?.reliableWindow !== undefined
+        ? Math.max(1, Math.floor(opts.reliableWindow))
+        : ReliableSequencer.DEFAULT_WINDOW,
     };
     if (!_inputReflectionCache.has(type)) {
       // SDK-deserializable ctor bytes (Reflection.decode rebuilds the ctor client-side).
@@ -163,7 +178,10 @@ export class RoomInput {
   // --- per-client lifecycle (called from Room._onJoin/_onLeave/etc.) ---
 
   /** Allocate the per-client input instance + decoder, the ring buffer (opt-in
-   *  via `bufferMaxSize > 0`, for rollback/lockstep), and the accessor. */
+   *  via `bufferMaxSize > 0`, for rollback/lockstep), and the accessor. A
+   *  fresh connection always starts at confirmation point 0; a reconnection
+   *  rebuilds at the frozen point via {@link restoreSession} once the room has
+   *  proven the seat. */
   allocate(client: Client & ClientPrivate): void {
     client._input = new this.options.ctor();
     // Wire-neutral zero values for fields with no construction default: a
@@ -176,7 +194,13 @@ export class RoomInput {
     const maxSize = this.options.bufferMaxSize;
     if (maxSize > 0) {
       // ctor → idle synthesis; client ref → idle ctx; idle policy → total drain()/next().
-      client._inputBuffer = new InputBufferImpl(maxSize, this.options.seqField, this.options.ctor, client, this.options.idle);
+      client._inputBuffer = new InputBufferImpl(
+        maxSize, this.options.seqField, this.options.ctor, client, this.options.idle,
+        this.options.reliableSequence, 0,
+      );
+    }
+    if (this.options.reliableSequence) {
+      client._inputSequencer = new ReliableSequencer(this.options.reliableWindow, 0);
     }
     client._inputAccessor = new InputAccessorImpl(client, this.nowOf);
   }
@@ -200,20 +224,59 @@ export class RoomInput {
   }
 
   /** Freeze a leaving seat: drop pending inputs so a held (reconnecting) session
-   *  idles from the first tick rather than replaying last-known moves. `_input`
-   *  (the idle ctx's `latest`) is left intact. */
-  freeze(client: ClientPrivate): void {
+   *  idles from the first tick rather than replaying last-known moves.
+   *  `_input` (the idle ctx's `latest`) is left intact. In explicit-seq mode
+   *  the session's confirmation point is captured FIRST — it is the one value
+   *  reconnection restores from. */
+  freeze(client: ClientPrivate, sessionId: string): void {
+    const seq = client._inputSequencer;
+    if (seq !== undefined) { this.sessionAcks.set(sessionId, seq.baseSeq); }
     client._inputBuffer?.clear();
+    // Drop the parked out-of-order window but KEEP the confirmation point
+    // (baseSeq): the wait on missing predecessors ends with the connection.
+    seq?.reset(seq.baseSeq);
   }
 
-  /** Drop a fully-gone session's accessor (delete of a missing key is a no-op). */
+  /** The session's frozen confirmation point for an explicit-seq reconnect
+   *  (0 for a fresh join / legacy room) — consumed once when the replacement
+   *  connection is allocated. */
+  consumeSessionAck(sessionId: string): number {
+    const ack = this.sessionAcks.get(sessionId) ?? 0;
+    this.sessionAcks.delete(sessionId);
+    return ack;
+  }
+
+  /** Re-initialize a reconnecting client's input state at the session's frozen
+   *  confirmation point. The replacement {@link allocate} ran with baseSeq 0
+   *  (the fresh-join default) before the room could prove the reconnection;
+   *  once proven, this rebuilds the explicit-seq buffer + sequencer with the
+   *  negotiated base so post-reconnect seqs line up — nothing older is
+   *  replayed into the sim. No-op for legacy (implicit-seq) rooms. */
+  restoreSession(client: Client & ClientPrivate, sessionId: string): void {
+    if (!this.options.reliableSequence) { return; }
+    const baseSeq = this.consumeSessionAck(sessionId);
+    const maxSize = this.options.bufferMaxSize;
+    if (maxSize > 0) {
+      client._inputBuffer = new InputBufferImpl(
+        maxSize, this.options.seqField, this.options.ctor, client, this.options.idle,
+        true, baseSeq,
+      );
+    }
+    client._inputSequencer = new ReliableSequencer(this.options.reliableWindow, baseSeq);
+    client._reckonBaseline = 0;
+  }
+
+  /** Drop a fully-gone session's accessor AND any held confirmation point
+   *  (delete of a missing key is a no-op). */
   release(sessionId: string): void {
     this.accessors.delete(sessionId);
+    this.sessionAcks.delete(sessionId);
   }
 
   /** Release every held accessor (room dispose). */
   dispose(): void {
     this.accessors.clear();
+    this.sessionAcks.clear();
   }
 
   // --- encode / decode (called from Room._onMessage) ---
@@ -222,7 +285,8 @@ export class RoomInput {
    * Sanitize the freshly-decoded `client._input`, then (when buffering is on)
    * push a clone into the per-client buffer. Honors the framework seq
    * (unreliable) / a user `inputOptions.seqField` (reliable) to dedupe the
-   * redundancy ring.
+   * redundancy ring. This is the LEGACY implicit-seq admission path — the
+   * explicit-seq reliable channel goes through {@link captureSequenced}.
    */
   capture(client: ClientPrivate, renderTime: number = 0, reckonTime: number = 0, seq?: number): void {
     // Sanitize before anything reads it (latest, the clone below, the idle ctx).
@@ -244,9 +308,51 @@ export class RoomInput {
     buf.push(inst.clone() as any, renderTime, reckonTime, seq);
   }
 
+  /**
+   * Explicit-seq reliable admission. The body was decoded into a scratch
+   * instance BEFORE this call (out-of-order frames therefore never mutated the
+   * live `latest`); this method:
+   * 1. asks the per-session {@link ReliableSequencer} what is admittable
+   *    (duplicates/stale frames are filtered pre-decode in
+   *    {@link decodeReliable}),
+   * 2. sanitizes each admitted REAL snapshot before it becomes visible,
+   * 3. records skipped seqs as gaps and pushes real ones ORDERED into the
+   *    buffer the fixed-timestep loop consumes.
+   * The contiguous run released by one delivery is pushed oldest → newest so
+   * the sim applies them in seq order.
+   */
+  private captureSequenced(
+    client: ClientPrivate,
+    sequencer: ReliableSequencer,
+    seq: number,
+    snapshot: any,
+    renderTime: number,
+    reckonTime: number,
+  ): void {
+    const buf = client._inputBuffer;
+    const admissions = sequencer.admit(seq, { snapshot, renderTime, reckonTime });
+    if (admissions.length === 0) { return; }
+    for (const a of admissions) {
+      if (a.snapshot === undefined) {
+        buf?.pushGap(a.seq);               // expired gap: ack advances, sim applies nothing
+        continue;
+      }
+      this.options.sanitize?.(a.snapshot);
+      // The newest REAL admitted frame becomes `latest` (idle ctx, `.latest`
+      // reads). Admissions run oldest → newest, so the last assignment wins.
+      client._input = a.snapshot;
+      if (buf) {
+        // The buffer owns a CLONE — the scratch instance may be released, and
+        // later admissions decode into fresh scratch instances.
+        buf.pushOrdered(a.snapshot.clone(), a.seq, a.renderTime, a.reckonTime);
+      }
+    }
+  }
+
   /** Decode a `ROOM_INPUT_RELIABLE` frame: an optional TIMED stamp prefix (shape
-   *  set by this room's derived stamp mode) then the input body. `it` starts at
-   *  offset 1, so the body begins at `it.offset`. */
+   *  set by this room's derived stamp mode), an optional SEQUENCED explicit seq
+   *  (opt-in, after the stamp), then the input body. `it` starts at offset 1,
+   *  so the body begins at `it.offset`. */
   decodeReliable(client: ClientPrivate, buffer: Buffer, it: Iterator, modifiers: number): void {
     if (!client._inputDecoder) { return; }
     // Optional stamp prefix (TIMED bit), DELTA-CODED, length set by this room's
@@ -273,8 +379,52 @@ export class RoomInput {
         renderTime = stamp;
       }
     }
+
+    // Explicit-seq channel (opt-in per room): the seq varint sits between the
+    // stamp and the body. A client that sends the bit to a room which didn't
+    // enable it (or vice versa) is a protocol mismatch — drop the frame rather
+    // than decoding the seq bytes as schema fields.
+    const sequenced = (modifiers & ProtocolModifier.SEQUENCED) !== 0;
+    const sequencer = client._inputSequencer;
+    if (sequenced && (sequencer === undefined || !this.options.reliableSequence)) {
+      debugAndPrintError(new Error(
+        '@colyseus/core: SEQUENCED reliable input from a session in a non-sequenced room — frame dropped.',
+      ));
+      return;
+    }
+    let orderedSeq = 0;
+    if (sequenced) {
+      orderedSeq = decode.number(buffer, it) >>> 0;
+      // Duplicate / stale / already-parked → drop BEFORE decoding: a resent
+      // input must not even overwrite `latest`, let alone re-apply a side effect.
+      if (sequencer!.isDuplicate(orderedSeq)) { return; }
+    } else if (sequencer !== undefined) {
+      // Legacy client against a sequenced ROOM: no explicit seq. Keep it on
+      // the ordered admission path (so it enters the explicit buffer and the
+      // confirmation point stays continuous) by numbering the frame implicitly
+      // — baseSeq+1, the transport's arrival order. The channel is ordered, so
+      // an implicit seq is always contiguous and admits immediately.
+      orderedSeq = (sequencer.baseSeq + 1) >>> 0;
+    }
+
+    // Any admission through the per-session policy decodes into a FRESH scratch
+    // instance (a legacy client in a sequenced room included): out-of-order
+    // frames never touch client._input until the policy admits them. A pure
+    // legacy room (no sequencer) decodes in place exactly as before.
+    const policyAdmission = sequencer !== undefined;
+    let scratch: any = undefined;
+    if (policyAdmission) {
+      scratch = new this.options.ctor();
+      seedInputZeroValues(scratch, this.options.ctor);
+    }
+    const body = buffer.subarray(it.offset, buffer.byteLength);
     try {
-      client._inputDecoder.decode(buffer.subarray(it.offset, buffer.byteLength));
+      if (scratch !== undefined) {
+        // A scratch Decoder: the bound decoder's ChangeTree targets client._input.
+        new Decoder(scratch).decode(body);
+      } else {
+        client._inputDecoder!.decode(body);
+      }
     } catch (e: any) {
       debugAndPrintError(e);
       return;
@@ -282,7 +432,12 @@ export class RoomInput {
     client._lastInputReceivedAt = performance.now();
     // Mirrors the SDK's sent count; echoed back as lastInputSeq for RTT.
     client._receivedInputCount = (client._receivedInputCount ?? 0) + 1;
-    this.capture(client, renderTime, reckonTime);
+
+    if (policyAdmission) {
+      this.captureSequenced(client, sequencer!, orderedSeq, scratch, renderTime, reckonTime);
+    } else {
+      this.capture(client, renderTime, reckonTime);
+    }
   }
 
   /** Decode a `ROOM_INPUT_UNRELIABLE` redundancy ring — each slot carries its
@@ -372,12 +527,15 @@ export class RoomInput {
    * The join-handshake input sections: INPUT_REFLECTION (the SDK-deserializable
    * input ctor bytes) and, when any runtime config differs from defaults,
    * INPUT_OPTIONS (`[flags uint8][tickRate varint?][patchRate varint?][subSteps
-   * varint?]`). The client mirrors RENDER_TIME/RECKON_TIME (auto-stamp timeline),
-   * tickRate (predict at dt=1/tickRate), patchRate (reconcile cadence), and
-   * subSteps (physics sub-steps per input, omitted when 1). Returns `undefined`
+   * varint?][lastAck varint?]`). The client mirrors RENDER_TIME/RECKON_TIME
+   * (auto-stamp timeline), tickRate (predict at dt=1/tickRate), patchRate
+   * (reconcile cadence), and subSteps (physics sub-steps per input, omitted
+   * when 1). On a RECONNECTION in explicit-seq reliable mode it additionally
+   * carries LAST_ACK + the session's frozen confirmation point — the one value
+   * the two sides negotiate; a fresh join carries neither. Returns `undefined`
    * when there's nothing to add.
    */
-  handshakeSections(): Array<{ tag: number; bytes: Uint8Array }> | undefined {
+  handshakeSections(client?: ClientPrivate, isReconnect: boolean = false): Array<{ tag: number; bytes: Uint8Array }> | undefined {
     let sections: Array<{ tag: number; bytes: Uint8Array }> | undefined;
     const inputBytes = _inputReflectionCache.get(this.options.ctor);
     if (inputBytes !== undefined) {
@@ -391,20 +549,30 @@ export class RoomInput {
       ? Math.round(this.room.patchRate) : undefined;
     const subSteps = (this.options.subSteps !== undefined && this.options.subSteps > 1)
       ? this.options.subSteps : undefined;
-    if (stampRender || stampReckon || tickRate || patchRate || subSteps) {
+    // Reconnection only: the last ORDERED seq the frozen session reached. The
+    // ack was consumed by Room.allocate() when the replacement connection was
+    // built; read the sequencer's live base (identical) here.
+    const lastAck = (isReconnect && this.options.reliableSequence)
+      ? (client?._inputSequencer?.baseSeq ?? 0)
+      : undefined;
+    if (stampRender || stampReckon || tickRate || patchRate || subSteps
+      || this.options.reliableSequence || lastAck !== undefined) {
       let flags = 0;
       if (stampRender) { flags |= InputFlags.RENDER_TIME; }
       if (stampReckon) { flags |= InputFlags.RECKON_TIME; }
       if (tickRate) { flags |= InputFlags.FIXED_TIMESTEP; }
       if (patchRate) { flags |= InputFlags.PATCH_RATE; }
       if (subSteps) { flags |= InputFlags.SUB_STEPS; }
-      // 24B: worst case = flags + float64 tickRate (9) + uint32 patchRate (5) + subSteps (2).
+      if (this.options.reliableSequence) { flags |= InputFlags.RELIABLE_SEQUENCE; }
+      if (lastAck !== undefined) { flags |= InputFlags.LAST_ACK; }
+      // 24B: worst case = flags + float64 tickRate (9) + uint32 patchRate (5) + subSteps (2) + lastAck (5).
       const buf = new Uint8Array(24);
       const sit = { offset: 0 };
       buf[sit.offset++] = flags;
       if (tickRate) { encode.number(buf, tickRate, sit); }
       if (patchRate) { encode.number(buf, patchRate, sit); }
       if (subSteps) { encode.number(buf, subSteps, sit); }
+      if (lastAck !== undefined) { encode.number(buf, lastAck >>> 0, sit); }
       (sections ??= []).push({
         tag: HandshakeSection.INPUT_OPTIONS,
         bytes: buf.subarray(0, sit.offset),

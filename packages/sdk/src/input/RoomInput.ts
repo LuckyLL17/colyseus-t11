@@ -62,6 +62,18 @@ export class RoomInput {
      *  (`setFixedTimestep(..., { subSteps })`). */
     #subSteps?: number;
 
+    /** Server advertised the explicit-seq reliable channel
+     *  (`defineInput({ reliableSequence: true })`, InputFlags.RELIABLE_SEQUENCE).
+     *  When set, the handle numbers every reliable input with its own seq and
+     *  negotiates/replays around the server's confirmation point. */
+    #reliableSequence = false;
+
+    /** Last ORDERED seq the server reported for this session on a reconnection
+     *  handshake (InputFlags.LAST_ACK); `undefined` on a fresh join. The handle
+     *  adopts it when created/reset so the replay starts exactly above the
+     *  server's confirmation point. */
+    #lastAck?: number;
+
     constructor(room: Room) {
         this.#room = room;
     }
@@ -91,8 +103,9 @@ export class RoomInput {
 
     /**
      * Decode the `INPUT_OPTIONS` handshake section.
-     * `[flags uint8][tickRate varint?][patchRate varint?][subSteps varint?]`,
-     * varints in bit order. Advances `it`.
+     * `[flags uint8][tickRate varint?][patchRate varint?][subSteps varint?][lastAck varint?]`,
+     * varints in bit order (the trailing `lastAck` appears only on a
+     * reconnection handshake — see InputFlags.LAST_ACK). Advances `it`.
      */
     applyOptions(buffer: Uint8Array, it: Iterator): void {
         const flags = buffer[it.offset++];
@@ -101,6 +114,19 @@ export class RoomInput {
         if (flags & InputFlags.FIXED_TIMESTEP) this.#tickRate = decode.number(buffer as Buffer, it);
         if (flags & InputFlags.PATCH_RATE) this.#patchRate = decode.number(buffer as Buffer, it);
         if (flags & InputFlags.SUB_STEPS) this.#subSteps = decode.number(buffer as Buffer, it);
+        // Capability bits: the sequenced reliable channel is server-driven.
+        this.#reliableSequence = (flags & InputFlags.RELIABLE_SEQUENCE) !== 0;
+        if (flags & InputFlags.LAST_ACK) {
+            // Reconnection: the one negotiated value. Stored for the handle
+            // whether it already exists or is created next.
+            this.#lastAck = decode.number(buffer as Buffer, it) >>> 0;
+            this.#handle?.adoptServerAck(this.#lastAck);
+        } else {
+            // A fresh (non-reconnect) handshake resets the negotiated point —
+            // otherwise a LAST_ACK from an earlier reconnect would leak into a
+            // handle created later on a fresh connection.
+            this.#lastAck = 0;
+        }
     }
 
     /** Feed the server's last-processed input seq to the handle; returns the RTT
@@ -109,9 +135,21 @@ export class RoomInput {
         return this.#handle ? this.#handle.ackInput(inputSeq) : -1;
     }
 
-    /** Reset the input round-trip on reconnect (see {@link Room} reconnection). */
+    /** Reset the input round-trip on reconnect (see {@link Room} reconnection).
+     *  In sequenced reliable mode this is deliberately light: the client's seq
+     *  numbering and replay ring survive the connection (the confirmation
+     *  point is re-negotiated via LAST_ACK when the handshake arrives, which
+     *  drives the ordered replay) — only the encoder's delta baseline is
+     *  cleared. Legacy handles do the full counter restart. */
     reset(): void {
         this.#handle?.reset();
+    }
+
+    /** Whether the (possibly existing) handle runs the explicit-seq channel —
+     *  lets {@link Room} decide its reconnect policy before the handle exists
+     *  (a client that never called room.input() has none). */
+    get sequenced(): boolean {
+        return this.#reliableSequence;
     }
 
     /**
@@ -149,6 +187,10 @@ export class RoomInput {
             tickRate: this.#tickRate,
             patchRate: this.#patchRate,
             subSteps: this.#subSteps,
+            // Opt-in per room; when on, a reconnection handshake may already
+            // carry the negotiated last ack.
+            reliableSequence: this.#reliableSequence,
+            lastAck: this.#lastAck ?? 0,
         });
         this.#options = options;
         this.#encoder = encoder;

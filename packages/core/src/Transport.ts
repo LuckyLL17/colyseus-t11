@@ -346,6 +346,15 @@ export interface ClientPrivate {
   _inputBuffer?: import('./input/InputBuffer.ts').InputBufferImpl;
 
   /**
+   * Per-client gate for the explicit-seq reliable input channel
+   * (`defineInput({ reliableSequence: true })`): confirmation point + bounded
+   * receive window + duplicate filtering. Allocated per connection alongside
+   * the buffer; on reconnect it is re-created from the session's frozen
+   * confirmation point (held by the RoomInput off the client object).
+   */
+  _inputSequencer?: import('./input/ReliableSequencer.ts').ReliableSequencer;
+
+  /**
    * Cached per-client accessor returned by `room.input(sessionId)`. Built
    * once at join (when the Room called `defineInput()`), so the public API
    * call is a Map lookup + property read with no per-call allocation.

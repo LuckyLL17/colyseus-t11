@@ -1,4 +1,4 @@
-import { encode } from '@colyseus/schema';
+import { encode, $values } from '@colyseus/schema';
 import { InputEncoder, type InputEncoderOptions, type InputMode } from '@colyseus/schema/input';
 import { Protocol, ProtocolModifier } from '@colyseus/shared-types';
 
@@ -148,6 +148,16 @@ export interface InputHandle<I = any> {
   readonly data: I;
   /** Wire mode this handle was constructed with. */
   readonly mode: InputMode;
+  /**
+   * Whether this handle numbers reliable inputs with its own explicit seq
+   * (server opted in with `defineInput({ reliableSequence: true })`). When
+   * true, sends carry `[varint seq]` behind the SEQUENCED modifier, the seq
+   * survives a reconnect (it's the client's numbering, not a connection
+   * count), and a reconnection handshake re-drives the ordered pending replay
+   * from the server's LAST_ACK. Always false on the unreliable channel (it
+   * keeps its framework wire seq).
+   */
+  readonly sequenced: boolean;
   /**
    * Server-advertised fixed simulation/input step rate in Hz, from
    * `defineInput({ tickRate })` cascaded through the join handshake. Predict at
@@ -311,6 +321,14 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
   // Sized WITH the replay ring (one seq window — replay and RTT age out together).
   private _sendTimes: Float64Array;
 
+  // Explicit-seq reliable channel (server-advertised via InputFlags.RELIABLE_SEQUENCE).
+  // When on, every reliable send carries its own 1-based seq on the wire behind
+  // ProtocolModifier.SEQUENCED, and the seq survives reconnects (it is the
+  // CLIENT's input numbering, not a connection count): on reattach the handle
+  // adopts the server's last-ORDERED ack and replays the pending tail. Off by
+  // default — the legacy path numbers implicitly by per-connection count.
+  private _sequenced = false;
+
   // Sent-input replay ring, mirroring the server's per-client input buffer: each reliable send snapshots
   // `data` into slot `seq % size` via alloc-free `copyInto` so a reconciler can replay unacked inputs.
   // Size = worst-case in-flight = (RTT + patch interval) × input rate. tickRate/patchRate from the
@@ -393,7 +411,12 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
     host: InputHandleHost,
     data: I,
     encoder: InputEncoder<any>,
-    opts?: { stampRender?: boolean; stampReckon?: boolean; renderDelay?: number; tickRate?: number; patchRate?: number; subSteps?: number; allowRewind?: (data: I) => boolean },
+    opts?: {
+      stampRender?: boolean; stampReckon?: boolean; renderDelay?: number;
+      tickRate?: number; patchRate?: number; subSteps?: number;
+      allowRewind?: (data: I) => boolean;
+      reliableSequence?: boolean; lastAck?: number;
+    },
   ) {
     this._host = host;
     this.data = data;
@@ -419,6 +442,9 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
     this._tickRate = opts?.tickRate;
     this._patchRate = opts?.patchRate;
     this._subSteps = opts?.subSteps ?? 1;
+    // Explicit-seq reliable channel. Only meaningful on the reliable encoder —
+    // unreliable keeps its framework wire seq (the bit is never set there).
+    this._sequenced = opts?.reliableSequence === true && encoder.mode === "reliable";
 
     // Size the replay ring to the advertised rates (see field comment).
     const stepMs = this._tickRate ? 1000 / this._tickRate : (1000 / 60);
@@ -428,9 +454,16 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
       Math.ceil((window / stepMs) * InputHandleImpl.BUFFER_HEADROOM),
     );
     this._sendTimes = new Float64Array(this._inputBufferSize);
+
+    // Reconnect with a negotiated confirmation point — after the rings exist
+    // (adoptServerAck reads them and kicks the ordered replay).
+    if (this._sequenced && (opts?.lastAck ?? 0) > 0) {
+      this.adoptServerAck(opts!.lastAck!);
+    }
   }
 
   get mode(): InputMode { return this._encoder.mode; }
+  get sequenced(): boolean { return this._sequenced; }
   get tickRate(): number | undefined { return this._tickRate; }
   // `1/hz` is correctly-rounded IEEE-754 → bit-identical to the server's stepSeconds.
   get stepSeconds(): number | undefined { return this._tickRate ? 1 / this._tickRate : undefined; }
@@ -480,6 +513,19 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
     // framework seq for unreliable (the encoder keeps `_seq` across its reset). pending
     // starts at 0 so a reconnect doesn't replay already-acked inputs, and unreliable
     // seqs continue past the server's last-seen seq if the buffer was reused.
+    if (this._sequenced) {
+      // Explicit-seq reliable: the numbering is the CLIENT's and survives the
+      // connection — do NOT zero _sentCount here. The disconnect-time reset only
+      // clears the encoder's delta baseline (so the reattach replay, triggered by
+      // adoptServerAck when the LAST_ACK handshake arrives, ships full
+      // snapshots). The confirmation point is re-negotiated, not assumed.
+      this._framed = null;
+      this._lastStamp = 0;
+      this._ringSlots = 0;
+      this._sendTimes.fill(0);
+      this._epoch++;
+      return;
+    }
     this._sentCount = this._lastProcessed = this._encoder.seq;
     this._framed = null;
     this._lastStamp = 0; // next stamped send ships an absolute delta — re-syncs the server's re-zeroed baseline
@@ -545,6 +591,10 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
     // delta-coded stamp vs a self-contained per-slot block; see
     // ProtocolModifier.TIMED and _writeRingStamps.
     const stampsEnabled = this._stampReckon || this._stampRender;
+    // Explicit seq reliable: the seq varint sits AFTER the stamp, BEFORE the
+    // body. The seq is assigned up front — a replay sends an explicit one via
+    // _sendReplay(), so the normal path only reaches here for the next new seq.
+    const sequenced = reliable && this._sequenced;
     // Evaluate `allowRewind` at most once: it's app code over live input data.
     // `allowRewind` gates the RELIABLE channel only — the unreliable ring is
     // all-or-nothing (see _writeRingStamps), so evaluating the app predicate
@@ -553,16 +603,20 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
       && (this._allowRewind === undefined || this._allowRewind(this.data));
     const wantRingStamp = stampsEnabled && !reliable;
     const both = this._stampReckon && this._stampRender;
+    // SEQUENCED adds one varint (the explicit seq) between the stamp and body.
     const stampMax = wantStamp
       ? RELIABLE_STAMP_MAX + (both ? 2 : 0)
       : (wantRingStamp ? ringStampMax(this._encoder.historySize, both) : 0);
-    const totalMax = 1 + stampMax + bytes.length;
+    const seqVarintMax = sequenced ? MAX_VARINT : 0;
+    const totalMax = 1 + stampMax + seqVarintMax + bytes.length;
     if (totalMax > this._scratch.byteLength) {
       this._scratch = new Uint8Array(Math.max(totalMax, this._scratch.byteLength * 2));
       this._framed = null;   // cached view points into the old buffer
     }
-    this._scratch[0] = (reliable ? Protocol.ROOM_INPUT_RELIABLE : Protocol.ROOM_INPUT_UNRELIABLE)
-      | ((wantStamp || wantRingStamp) ? ProtocolModifier.TIMED : 0);
+    let leading = (reliable ? Protocol.ROOM_INPUT_RELIABLE : Protocol.ROOM_INPUT_UNRELIABLE)
+      | ((wantStamp || wantRingStamp) ? ProtocolModifier.TIMED : 0)
+      | (sequenced ? ProtocolModifier.SEQUENCED : 0);
+    this._scratch[0] = leading;
 
     const it = { offset: 1 };
     if (wantRingStamp) {
@@ -579,21 +633,23 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
       this._pendingReckon = 0; // not stamping → no reckon instant to record
     }
 
-    // [stamp?][body] — body continues from the stamp's end offset.
-    this._scratch.set(bytes, it.offset);
-    const total = it.offset + bytes.length;
-
-    if (this._framed === null || this._framed.byteLength !== total) {
-      this._framed = this._scratch.subarray(0, total);   // reused view (size varies only with the stamp prefix)
-    }
-    const framed = this._framed;
+    // [stamp?][seq?][body].
     let seq: number;
     if (reliable) {
-      conn.send(framed);
       // Reliable: implicit count seq — the server counts received messages, so
-      // `_sentCount` mirrors its consumed counter for the next TIMED ack.
+      // `_sentCount` mirrors its consumed counter for the next TIMED ack. In
+      // sequenced mode the count IS the client-owned explicit seq (1-based),
+      // written to the wire for the server's ordering/dedupe policy.
       seq = ++this._sentCount;
+      if (sequenced) { encode.number(this._scratch, seq >>> 0, it); }
+      this._scratch.set(bytes, it.offset);
+      const total = it.offset + bytes.length;
+      const framed = this._frameView(total);
+      conn.send(framed);
     } else {
+      this._scratch.set(bytes, it.offset);
+      const total = it.offset + bytes.length;
+      const framed = this._frameView(total);
       conn.sendUnreliable(framed);
       // Unreliable: adopt the encoder's framework seq (stamped on the wire) so the
       // server's seq-value ack and this replay ring line up across packet loss.
@@ -603,6 +659,14 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
     // Local, not _sentCount: a re-entrant send() from an onSend listener would
     // have advanced the field before this returns.
     return seq;
+  }
+
+  /** Reuse-or-mint the cached framed view for `total` bytes. */
+  private _frameView(total: number): Uint8Array {
+    if (this._framed === null || this._framed.byteLength !== total) {
+      this._framed = this._scratch.subarray(0, total);   // reused view (size varies only with the prefix)
+    }
+    return this._framed;
   }
 
   /**
@@ -737,6 +801,115 @@ export class InputHandleImpl<I = any> implements InputHandle<I> {
       next.splice(i, 1);
       this._sendListeners = next.length > 0 ? next : null;
     };
+  }
+
+  /**
+   * @internal Adopt the server's last-ORDERED seq from a reconnection
+   * handshake (InputFlags.LAST_ACK) — the SINGLE value the two sides negotiate.
+   *
+   * Effects:
+   * - the confirmation point (`_lastProcessed`) moves up to it (never down),
+   * - inputs still held above it are REPLAYED over the new connection in seq
+   *   order ("可靠 input 的有序重放"), each as a self-contained frame,
+   * - subsequent user sends keep numbering from `_sentCount` (which the replay
+   *   left untouched), so the seq stream is continuous across the reconnect.
+   *
+   * Idempotent: a later ack smaller than the current one is ignored.
+   */
+  adoptServerAck(lastAck: number): void {
+    if (!this._sequenced) { return; }
+    const ack = lastAck >>> 0;
+    if (ack <= this._lastProcessed) { return; }
+    this._lastProcessed = ack;
+    // The new server session has no delta baseline — the next frame must be a
+    // full snapshot. reset() also clears the unreliable ring (n/a here) but
+    // keeps the replay ring entries, gated by _sentCount/_lastProcessed.
+    this._encoder.reset();
+    this._lastStamp = 0; // next stamped send ships an absolute delta
+    this._replayPending();
+  }
+
+  /** Re-send, in seq order, every still-buffered input above
+   *  {@link lastProcessed}. Each replay frame is a FULL snapshot (the server
+   *  replacement session has no delta baseline) carrying its original seq in
+   *  the SEQUENCED slot; after the run the staged `data` is restored and the
+   *  encoder left in full-snapshot state, so the next live send resumes the
+   *  delta stream correctly. Allocations are bounded by the pending set (a
+   *  reconnect event, not the hot path). */
+  private _replayPending(): void {
+    const conn = this._host.connection;
+    if (!conn?.isOpen || this._inputBuffer === null) { return; }
+    const from = this._lastProcessed + 1;
+    const to = this._sentCount;
+    if (from > to) { return; }
+    const size = this._inputBufferSize;
+    const Ctor = (this.data as any).constructor;
+    // Preserve the user's staged live input across the load/encode churn.
+    const saved = new Ctor() as I;
+    this._encoder.copyInto(saved as any);
+    for (let s = from; s <= to; s++) {
+      // Aged out of the client ring → the server's window expired it too.
+      if (s - this._lastProcessed > size) { break; }
+      const snap = this._inputBuffer[s % size];
+      if (snap === undefined) { continue; }
+      // _loadSnapshot leaves the encoder in full-snapshot state → every replay
+      // is self-contained regardless of the frames around it.
+      this._loadSnapshot(snap);
+      this._sendReplayFrame(s);
+    }
+    // Restore the staged data as a full snapshot: the server's delta baseline
+    // now ends at the last REPLAYED frame, not at the user's live `data`, so
+    // the next send must emit its complete state.
+    this._loadSnapshot(saved);
+  }
+
+  /** Copy every field value of `source` into the encoder's bound instance
+   *  (`data`) so the next `encode()` describes `source`. Schema fields live in
+   *  the dense `$values` array (the same walk the codec's copyInto uses); a
+   *  direct-array copy followed by `encoder.reset()` marks every populated
+   *  field dirty, so the next emit is a full snapshot of `source`. */
+  private _loadSnapshot(source: I): void {
+    const src = (source as any)[$values];
+    const dst = (this.data as any)[$values];
+    for (let i = 0; i < dst.length; i++) { dst[i] = src[i]; }
+    this._encoder.reset();
+  }
+
+  /** Encode the currently-loaded snapshot as a replay frame for `seq` and send
+   *  it on the reliable channel with the SEQUENCED (+optional TIMED) prefix.
+   *  Mirrors {@link send}'s framing but pins the seq and skips the per-send
+   *  counter/record bookkeeping (the input was recorded when first sent). */
+  private _sendReplayFrame(seq: number): void {
+    const conn = this._host.connection!;
+    const bytes = this._encoder.encode();
+    // RECKON rooms: replay the recorded absolute reckon instant (the new
+    // server baseline starts at 0). RENDER-only rooms have no per-input record
+    // the handle can reconstruct standalone — ship unstamped (server reads
+    // live), matching the pre-clock-sync convention.
+    let stamp = 0;
+    if (this._stampReckon) {
+      stamp = this._reckonTimes?.[seq % this._inputBufferSize] ?? 0;
+    }
+    const wantStamp = stamp > 0;
+    const both = this._stampReckon && this._stampRender;
+    const stampMax = wantStamp ? RELIABLE_STAMP_MAX + (both ? 2 : 0) : 0;
+    const totalMax = 1 + stampMax + MAX_VARINT + bytes.length;
+    if (totalMax > this._scratch.byteLength) {
+      this._scratch = new Uint8Array(Math.max(totalMax, this._scratch.byteLength * 2));
+      this._framed = null;
+    }
+    this._scratch[0] = Protocol.ROOM_INPUT_RELIABLE
+      | ProtocolModifier.SEQUENCED
+      | (wantStamp ? ProtocolModifier.TIMED : 0);
+    const it = { offset: 1 };
+    if (wantStamp) {
+      encode.number(this._scratch, stamp - this._lastStamp, it); // first replay: absolute (baseline was reset to 0)
+      this._lastStamp = stamp;
+      if (both) { encode.uint16(this._scratch, 0, it); }         // replay carries no interp-delta term
+    }
+    encode.number(this._scratch, seq >>> 0, it);
+    this._scratch.set(bytes, it.offset);
+    conn.send(this._frameView(it.offset + bytes.length));
   }
 
   /**

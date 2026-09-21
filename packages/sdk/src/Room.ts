@@ -757,12 +757,18 @@ export class Room<
         if (!this.reconnection.isReconnecting) {
             this.reconnection.retryCount = 0;
             this.reconnection.isReconnecting = true;
-            // The server allocates a FRESH input buffer for the reconnected client
-            // (its consumed counter restarts at 0). Zero ours now so post-reconnect
-            // seqs line up — otherwise every ack echo (≤ the old counter) is
-            // discarded until the new counter catches up past it, and `sentCount`
-            // stays permanently ahead. Reconcilers follow this reset on their own
-            // (they poll the handle's `epoch`) — no `onReconnect` wiring needed.
+            // Reconnect bookkeeping for the input round-trip:
+            // - Legacy implicit-count reliable: the server allocates a FRESH
+            //   input buffer (its consumed counter restarts at 0), so zero the
+            //   counters here — otherwise every ack echo (≤ the old counter) is
+            //   discarded until the new counter catches up, and `sentCount`
+            //   stays permanently ahead.
+            // - Explicit-seq reliable (`reliableSequence`): the numbering is the
+            //   CLIENT's and survives — reset() only clears the encoder's delta
+            //   baseline; the confirmation point arrives in the reconnection
+            //   handshake (LAST_ACK) and drives the ordered pending replay.
+            // Reconcilers follow the reset on their own (they poll the handle's
+            // `epoch`) — no `onReconnect` wiring needed.
             this.#input?.reset();
         }
 

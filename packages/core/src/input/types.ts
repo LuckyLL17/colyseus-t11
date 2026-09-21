@@ -143,6 +143,42 @@ export interface DefineInputOptions<I = any> {
    * instead — pass it here only when the room runs its own loop.
    */
   subSteps?: number;
+  /**
+   * Opt-in explicit seq for the RELIABLE input channel (`false` by default).
+   *
+   * When off (the default, and always for `mode:"unreliable"` clients)
+   * reliable inputs keep their legacy ordering: the transport is ordered, the
+   * server admits every frame on arrival and numbers it implicitly by receive
+   * count — old clients that send no seq keep working byte-for-byte as before.
+   *
+   * When on, the client numbers every reliable input with its OWN 1-based
+   * monotonic seq and the server, per session, keeps:
+   * - a confirmation point (the last ORDERED seq) and a bounded receive
+   *   window,
+   * - duplicate filtering BEFORE decode (a resent input can never re-apply a
+   *   side effect — not even overwrite `latest`),
+   * - in-order admission across gaps, with expired gaps SKIPPED rather than
+   *   waited on forever (see {@link reliableWindow}),
+   * - reconnect negotiation of the confirmation point alone: the rejoining
+   *   client is told the server's last ack and replays the still-pending
+   *   inputs above it in seq order.
+   *
+   * Advertised to clients through the join handshake
+   * (`InputFlags.RELIABLE_SEQUENCE`); only clients that understand it switch
+   * to sequenced frames — the capability is per-room, so a mixed deployment
+   * stays compatible.
+   */
+  reliableSequence?: boolean;
+  /**
+   * Per-session receive-window depth (in seqs) for {@link reliableSequence}:
+   * how far ahead of the last ordered seq an out-of-order frame may be parked
+   * waiting for its predecessors. A frame past the window expires the gap in
+   * between (the missing inputs are skipped, not stalled on forever).
+   * Default 32. Tune with the reliable channel's realistic reordering burst,
+   * not the RTT — the channel is ordered, so this mostly bounds the replay
+   * burst on reconnect.
+   */
+  reliableWindow?: number;
 }
 
 /** `true` when the defineInput opts declared an `idle` policy — narrows the
@@ -229,6 +265,14 @@ export interface NormalizedInputOptions {
    * `latest` / the buffer / the idle ctx.
    */
   sanitize?: (instance: any) => void;
+
+  /** Opt-in explicit-seq reliable channel — see
+   *  {@link DefineInputOptions.reliableSequence}. */
+  reliableSequence: boolean;
+
+  /** Per-session receive-window depth for the explicit-seq channel — see
+   *  {@link DefineInputOptions.reliableWindow}. */
+  reliableWindow: number;
 }
 
 /**
